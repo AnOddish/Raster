@@ -248,6 +248,79 @@ void WriteImageToFile(std::string fileName, sycl::host_accessor<Vec3, 2> imageBu
     file.flush();
 }
 
+struct VertexShader {
+    sycl::accessor<Vertex, 1, sycl::access::mode::read> verticesAcc;
+    sycl::accessor<std::uint16_t, 1, sycl::access::mode::read> indexAcc;
+    sycl::accessor<Matrix, 1, sycl::access::mode::read> transform;
+    sycl::accessor<Tri, 1, sycl::access::mode::write> vertexOutAcc;
+
+    void operator()(sycl::nd_item<1> triangle) const {
+        size_t vertexIndex = indexAcc[triangle.get_global_id()];
+
+        // apply the transform
+        Vec4 position = transform[0] * Vec4(verticesAcc[vertexIndex].position, 1);
+        position = position / position.w;
+        //scale from screen space into pixels relative to the output size
+        position.i = (position.i + 1) * (WIDTH / 2.f);
+        position.j = (position.j + 1) * (HEIGHT / 2.f);
+
+        // put the data in out buffer
+        vertexOutAcc[triangle.get_group(0)].positions[triangle.get_local_id(0)] = { position.i, position.j };
+        vertexOutAcc[triangle.get_group(0)].colours[triangle.get_local_id(0)] = verticesAcc[vertexIndex].colour;
+    }
+};
+
+struct PixelShader {
+    sycl::accessor<Tri, 1, sycl::access::mode::read> vertexAcc;
+    sycl::accessor<Vec3, 2, sycl::access::mode::write> imageAcc;
+
+    void operator()(sycl::id<1> triangle) const {
+        Vec2 p0 = vertexAcc[triangle.get(0)].positions[0];
+        Vec2 p1 = vertexAcc[triangle.get(0)].positions[1];
+        Vec2 p2 = vertexAcc[triangle.get(0)].positions[2];
+
+        //Compute the bounding box of a triangle
+        float minX = sycl::min(p0.i, sycl::min(p1.i, p2.i));
+        float minY = sycl::min(p0.j, sycl::min(p1.j, p2.j));
+
+        float maxX = sycl::max(p0.i, sycl::max(p1.i, p2.i));
+        float maxY = sycl::max(p0.j, sycl::max(p1.j, p2.j));
+
+        float denom = edge(p0, p1, p2);
+        // makes sure the triangle is actually possible to render
+        if (denom == 0)
+            return;
+
+        for (int y = static_cast<int>(sycl::floor(minY)); y < static_cast<int>(sycl::ceil(maxY)); y++) {
+            if (y < 0 || y >= HEIGHT) continue;
+            for (int x = static_cast<int>(sycl::floor(minX)); x < static_cast<int>(sycl::ceil(maxX)); x++) {
+                if (x < 0 || x >= WIDTH) continue;
+                Vec2 pixel = { x + 0.5 , y + 0.5 }; // sample the centre of the pixel
+
+                float weight0 = edge(p1, p2, pixel) / denom;
+                float weight1 = edge(p2, p0, pixel) / denom;
+                float weight2 = edge(p0, p1, pixel) / denom;
+
+                // checks if the point is in the triangle
+                if (weight0 < 0.f || weight1 < 0 || weight2 < 0)
+                    continue;
+
+                // blends between the triangles
+                Vec3 colour = vertexAcc[triangle.get(0)].colours[0] * weight0 + vertexAcc[triangle.get(0)].colours[1] * weight1 + vertexAcc[triangle.get(0)].colours[2] * weight2;
+
+                // Triangles can over lap so uhh race condition, not the best solution but the proper way of doing feels out of scope
+                auto pixelI = sycl::atomic_ref<float, sycl::memory_order::relaxed, sycl::memory_scope::device>(imageAcc[sycl::id<2>(static_cast<size_t>(x), static_cast<size_t>(y))].i);
+                auto pixelJ = sycl::atomic_ref<float, sycl::memory_order::relaxed, sycl::memory_scope::device>(imageAcc[sycl::id<2>(static_cast<size_t>(x), static_cast<size_t>(y))].j);
+                auto pixelK = sycl::atomic_ref<float, sycl::memory_order::relaxed, sycl::memory_scope::device>(imageAcc[sycl::id<2>(static_cast<size_t>(x), static_cast<size_t>(y))].k);
+
+                pixelI.store(colour.i);
+                pixelJ.store(colour.j);
+                pixelK.store(colour.k);
+            }
+        }
+    }
+};
+
 int main() {
     std::vector<Vertex> vertices = {
         {{0.0, 0.0, 1.0}, {1.0, 0.0, 0.0}},
@@ -288,21 +361,7 @@ int main() {
         auto vertexOutAcc = vertexOutBuffer.get_access<sycl::access::mode::write>(handler);
 
         // go triangle by triangle and perform the transform and move it into the triangle buffer
-        handler.parallel_for(sycl::nd_range<1>(indices.size(), 3), [=](sycl::nd_item<1> triangle) {
-            // get the index of the triangle
-            size_t vertexIndex = indexAcc[triangle.get_global_id()];
-
-            // apply the transform
-            Vec4 position = transform[0] * Vec4(verticesAcc[vertexIndex].position, 1);
-            position = position / position.w;
-            //scale from screen space into pixels relative to the output size
-            position.i = (position.i + 1) * (WIDTH / 2.f);
-            position.j = (position.j + 1) * (HEIGHT / 2.f);
-
-            // put the data in out buffer
-            vertexOutAcc[triangle.get_group(0)].positions[triangle.get_local_id(0)] = { position.i, position.j };
-            vertexOutAcc[triangle.get_group(0)].colours[triangle.get_local_id(0)] = verticesAcc[vertexIndex].colour;
-        });
+        handler.parallel_for(sycl::nd_range<1>(indices.size(), 3), VertexShader{ verticesAcc , indexAcc, transform, vertexOutAcc});
     });
 
     queue.wait();
@@ -315,51 +374,7 @@ int main() {
 
         size_t numberOfTriangles = indices.size() / 3;
         //A work group for each triangle
-        handler.parallel_for(sycl::range<1>(numberOfTriangles), [=](sycl::id<1> triangle) {
-            Vec2 p0 = vertexAcc[triangle.get(0)].positions[0];
-            Vec2 p1 = vertexAcc[triangle.get(0)].positions[1];
-            Vec2 p2 = vertexAcc[triangle.get(0)].positions[2];
-
-            //Compute the bounding box of a triangle
-            float minX = sycl::min(p0.i, sycl::min(p1.i, p2.i));
-            float minY = sycl::min(p0.j, sycl::min(p1.j, p2.j));
-
-            float maxX = sycl::max(p0.i, sycl::max(p1.i, p2.i));
-            float maxY = sycl::max(p0.j, sycl::max(p1.j, p2.j));
-
-            float denom = edge(p0, p1, p2);
-            // makes sure the triangle is actually possible to render
-            if (denom == 0)
-                return;
-
-            for (int y = static_cast<int>(sycl::floor(minY)); y < static_cast<int>(sycl::ceil(maxY)); y++) {
-                if (y < 0 || y >= HEIGHT) continue;
-                for (int x = static_cast<int>(sycl::floor(minX)); x < static_cast<int>(sycl::ceil(maxX)); x++) {
-                    if (x < 0 || x >= WIDTH) continue;
-                    Vec2 pixel = { x + 0.5 , y + 0.5 }; // sample the centre of the pixel
-
-                    float weight0 = edge(p1, p2, pixel) / denom;
-                    float weight1 = edge(p2, p0, pixel) / denom;
-                    float weight2 = edge(p0, p1, pixel) / denom;
-
-                    // checks if the point is in the triangle
-                    if (weight0 < 0.f || weight1 < 0 || weight2 < 0)
-                        continue;
-
-                    // blends between the triangles
-                    Vec3 colour = vertexAcc[triangle.get(0)].colours[0] * weight0 + vertexAcc[triangle.get(0)].colours[1] * weight1 + vertexAcc[triangle.get(0)].colours[2] * weight2;
-                    
-                    // Triangles can over lap so uhh race condition, not the best solution but the proper way of doing feels out of scope
-                    auto pixelI = sycl::atomic_ref<float, sycl::memory_order::relaxed, sycl::memory_scope::device>(imageAcc[sycl::id<2>(static_cast<size_t>(x), static_cast<size_t>(y))].i);
-                    auto pixelJ = sycl::atomic_ref<float, sycl::memory_order::relaxed, sycl::memory_scope::device>(imageAcc[sycl::id<2>(static_cast<size_t>(x), static_cast<size_t>(y))].j);
-                    auto pixelK = sycl::atomic_ref<float, sycl::memory_order::relaxed, sycl::memory_scope::device>(imageAcc[sycl::id<2>(static_cast<size_t>(x), static_cast<size_t>(y))].k);
-
-                    pixelI.store(colour.i);
-                    pixelJ.store(colour.j);
-                    pixelK.store(colour.k);
-                }
-            }
-        });
+        handler.parallel_for(sycl::range<1>(numberOfTriangles), PixelShader{vertexAcc, imageAcc});
     });
 
     queue.wait();
