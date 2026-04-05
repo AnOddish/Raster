@@ -287,7 +287,7 @@ int main() {
         auto transform = transformBuffer.get_access<sycl::access::mode::read>(handler);
         auto vertexOutAcc = vertexOutBuffer.get_access<sycl::access::mode::write>(handler);
 
-        // go triangle by triangle and perform the transform and move it into the triangle buffer;
+        // go triangle by triangle and perform the transform and move it into the triangle buffer
         handler.parallel_for(sycl::nd_range<1>(indices.size(), 3), [=](sycl::nd_item<1> triangle) {
             // get the index of the triangle
             size_t vertexIndex = indexAcc[triangle.get_global_id()];
@@ -295,7 +295,7 @@ int main() {
             // apply the transform
             Vec4 position = transform[0] * Vec4(verticesAcc[vertexIndex].position, 1);
             position = position / position.w;
-            //scale from screen space into pixels
+            //scale from screen space into pixels relative to the output size
             position.i = (position.i + 1) * (WIDTH / 2.f);
             position.j = (position.j + 1) * (HEIGHT / 2.f);
 
@@ -328,7 +328,7 @@ int main() {
             float maxY = sycl::max(p0.j, sycl::max(p1.j, p2.j));
 
             float denom = edge(p0, p1, p2);
-            // makes sure the triangle is actually  possible
+            // makes sure the triangle is actually possible to render
             if (denom == 0)
                 return;
 
