@@ -248,6 +248,7 @@ void WriteImageToFile(std::string fileName, sycl::host_accessor<Vec3, 2> imageBu
     file.flush();
 }
 
+// The first kernal called
 struct VertexShader {
     sycl::accessor<Vertex, 1, sycl::access::mode::read> verticesAcc;
     sycl::accessor<std::uint16_t, 1, sycl::access::mode::read> indexAcc;
@@ -270,6 +271,7 @@ struct VertexShader {
     }
 };
 
+//The second kernal called
 struct PixelShader {
     sycl::accessor<Tri, 1, sycl::access::mode::read> vertexAcc;
     sycl::accessor<Vec3, 2, sycl::access::mode::write> imageAcc;
