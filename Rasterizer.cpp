@@ -354,7 +354,7 @@ int main() {
     auto start = std::chrono::high_resolution_clock::now();
 
     // This is the vertex shader, all it does is apply the transform to the vertex which convert into screen coordinates
-    // This may feel like an over kill way of doing this but its the most convient way of doing it "Nicely"
+    // This may feel like an over kill way of doing this but its the most convient way of doing it "Nicely" without loosing information
     queue.submit([&](sycl::handler& handler) {
         auto verticesAcc = vertexInBuffer.get_access<sycl::access::mode::read>(handler);
         auto indexAcc = indexBuffer.get_access<sycl::access::mode::read>(handler);
