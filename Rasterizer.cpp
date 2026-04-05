@@ -54,7 +54,7 @@ struct Vec3 {
         return { i - other.i, j - other.j, k - other.k };
     }
 
-    // multiplying two vectors
+    // multiplying a vector by a scalar value
     Vec3 operator*(const float& scalar) const {
         return { i * scalar, j * scalar, k * scalar };
     }
@@ -132,7 +132,6 @@ struct Matrix {
             for (int col = 0; col < 4; col++)
                 out[row] += data[row * 4 + col] * vals[col];
 
-        // Renormalise the vector
         Vec4 vOut = { out[0], out[1], out[2], out[3] };
         return vOut;
     }
@@ -153,13 +152,13 @@ struct Tri {
     std::array<Vec3, 3> colours;
 };
 
-// This function is used to calculate the denominator of the edges weights used to simplify the maths
+// This function is used to calculate the denominator of the edges weights used to simplify the maths when converting to barycentric coordinates
 float edge(Vec2 a, Vec2 b, Vec2 c) {
     return (b.i - a.i) * (c.j - a.j) - (b.j - a.j) * (c.i - a.i);
 }
 
 Matrix GetViewMatrix(Vec3 right, Vec3 up, Vec3 front, Vec3 position) {
-    //This matrix is used to set the position of the camera.
+    //This matrix is used to set the position of the camera and its rotation
 
     Matrix view;
     view(0, 0) = right.i;
@@ -249,7 +248,7 @@ void WriteImageToFile(std::string fileName, sycl::host_accessor<Vec3, 2> imageBu
     file.flush();
 }
 
-int main(int argc, char* argv[]) {
+int main() {
     std::vector<Vertex> vertices = {
         {{0.0, 0.0, 1.0}, {1.0, 0.0, 0.0}},
         {{1.0, 0.0, 1.0}, {0.0, 1.0, 0.0}},
@@ -271,7 +270,7 @@ int main(int argc, char* argv[]) {
     Matrix finalTransform = GetViewMatrix({1, 0, 0}, {0, 1, 0}, {0, 0, 1}, {-0.5f, -0.5f, -2.5f}) * GetPerspectiveMatrix(90.f, 0.1f, 1000.f);
     sycl::buffer<Matrix, 1> transformBuffer(&finalTransform, sycl::range<1>(1));
 
-    // the buffer used after 
+    // the buffer used after vertex shader
     sycl::buffer<Tri, 1> vertexOutBuffer(sycl::range<1>(indices.size() / 3));
 
 
@@ -279,7 +278,8 @@ int main(int argc, char* argv[]) {
 
     auto start = std::chrono::high_resolution_clock::now();
 
-    //This is the vertex shader, all it does is apply the transform to the vertex
+    // This is the vertex shader, all it does is apply the transform to the vertex which convert into screen coordinates
+    // This may feel like an over kill way of doing this but its the most convient way of doing it "Nicely"
     queue.submit([&](sycl::handler& handler) {
         auto verticesAcc = vertexInBuffer.get_access<sycl::access::mode::read>(handler);
         auto indexAcc = indexBuffer.get_access<sycl::access::mode::read>(handler);
@@ -288,7 +288,6 @@ int main(int argc, char* argv[]) {
         auto vertexOutAcc = vertexOutBuffer.get_access<sycl::access::mode::write>(handler);
 
         // go triangle by triangle and perform the transform and move it into the triangle buffer;
-        // 
         handler.parallel_for(sycl::nd_range<1>(indices.size(), 3), [=](sycl::nd_item<1> triangle) {
             // get the index of the triangle
             size_t vertexIndex = indexAcc[triangle.get_global_id()];
@@ -308,7 +307,7 @@ int main(int argc, char* argv[]) {
 
     queue.wait();
 
-    //this is the pixel shader
+    //this is the pixel shader, it handles the colour of each triangle
     queue.submit([&](sycl::handler& handler) {
         auto vertexAcc = vertexOutBuffer.get_access<sycl::access::mode::read>(handler);
 
@@ -349,7 +348,8 @@ int main(int argc, char* argv[]) {
 
                     // blends between the triangles
                     Vec3 colour = vertexAcc[triangle.get(0)].colours[0] * weight0 + vertexAcc[triangle.get(0)].colours[1] * weight1 + vertexAcc[triangle.get(0)].colours[2] * weight2;
-
+                    
+                    // Triangles can over lap so uhh race condition, not the best solution but the proper way of doing feels out of scope
                     auto pixelI = sycl::atomic_ref<float, sycl::memory_order::relaxed, sycl::memory_scope::device>(imageAcc[sycl::id<2>(static_cast<size_t>(x), static_cast<size_t>(y))].i);
                     auto pixelJ = sycl::atomic_ref<float, sycl::memory_order::relaxed, sycl::memory_scope::device>(imageAcc[sycl::id<2>(static_cast<size_t>(x), static_cast<size_t>(y))].j);
                     auto pixelK = sycl::atomic_ref<float, sycl::memory_order::relaxed, sycl::memory_scope::device>(imageAcc[sycl::id<2>(static_cast<size_t>(x), static_cast<size_t>(y))].k);
@@ -366,6 +366,7 @@ int main(int argc, char* argv[]) {
 
     auto end = std::chrono::high_resolution_clock::now();
     std::cout << std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count() << std::endl;
+
     sycl::host_accessor<Vec3, 2> imageAcc = imageBuffer.get_host_access();
     WriteImageToFile("test", imageAcc);
 }
