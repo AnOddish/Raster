@@ -1,7 +1,6 @@
 #include <sycl/sycl.hpp>
 #include <vector>
 #include <array>
-#include <algorithm>
 #include <string>
 #include <chrono>
 #include <cmath>
