@@ -1,10 +1,10 @@
 #include <sycl/sycl.hpp>
 #include <vector>
-#include <array>
 #include <string>
 #include <chrono>
 #include <cmath>
 #include <numbers>
+#include <random>
 
 constexpr int WIDTH = 1280;
 constexpr int HEIGHT = 720;
@@ -62,10 +62,10 @@ struct Vec3 {
 
 // the cross product of two 3D vectors
 Vec3 cross(const Vec3& v1, const Vec3& v2) {
-    return { 
+    return {
         v1.j * v2.k - v1.k * v2.j,
         v1.k * v2.i - v1.i * v2.k,
-        v1.i * v2.j - v1.j * v2.i 
+        v1.i * v2.j - v1.j * v2.i
     };
 }
 
@@ -91,11 +91,13 @@ struct Vec4 {
 
 // this is a 4x4 matrix
 struct Matrix {
-    std::array<float, 16> data;
+    float data[16];
 
     // initialise an array 
     Matrix() {
-        data.fill(0);
+        for (int i = 0; i < 16; i++) {
+            data[i] = 0;
+        }
         data[0] = 1;
         data[1 * 4 + 1] = 1;
         data[2 * 4 + 2] = 1;
@@ -109,7 +111,9 @@ struct Matrix {
     Matrix operator*(const Matrix& other) const {
         //Create a matrix full of 0s
         Matrix result;
-        result.data.fill(0);
+        for (int i = 0; i < 16; i++) {
+            result.data[i] = 0;
+        }
 
         // a quick a dirty 4x4 x 4x4 matrix multiplication algorithm
         // its not the point here
@@ -148,8 +152,8 @@ struct Vertex {
 };
 
 struct Tri {
-    std::array<Vec2, 3> positions;
-    std::array<Vec3, 3> colours;
+    Vec2 positions[3];
+    Vec3 colours[3];
 };
 
 // This function is used to calculate the denominator of the edges weights used to simplify the maths when converting to barycentric coordinates
@@ -192,7 +196,7 @@ Matrix GetPerspectiveMatrix(float fov, float near, float far) {
     perp(3, 2) = (2 * far * near) / (near - far);
     perp(2, 3) = -1.f;
     perp(3, 3) = 0;
-     
+
     return perp;
 }
 
@@ -297,7 +301,7 @@ struct PixelShader {
             if (y < 0 || y >= HEIGHT) continue;
             for (int x = static_cast<int>(sycl::floor(minX)); x < static_cast<int>(sycl::ceil(maxX)); x++) {
                 if (x < 0 || x >= WIDTH) continue;
-                Vec2 pixel = { x + 0.5 , y + 0.5 }; // sample the centre of the pixel
+                Vec2 pixel = { x + 0.5f , y + 0.5f }; // sample the centre of the pixel
 
                 float weight0 = edge(p1, p2, pixel) / denom;
                 float weight1 = edge(p2, p0, pixel) / denom;
@@ -323,67 +327,172 @@ struct PixelShader {
     }
 };
 
-int main() {
-    std::vector<Vertex> vertices = {
-        {{0.0, 0.0, 1.0}, {1.0, 0.0, 0.0}},
-        {{1.0, 0.0, 1.0}, {0.0, 1.0, 0.0}},
-        {{0.0, 1.0, 1.0}, {0.0, 0.0, 1.0}},
-        {{1.0, 1.0, 1.0}, {1.0, 0.0, 1.0}}
-    };
+void generateTriangles(const int& amount, std::vector<Vertex>& verticies, std::vector<std::uint16_t>& indicies) {
+    int min = -10.f;
+    int max = 10.f;
 
-    std::vector<std::uint16_t> indices = {
-        0, 1, 2, 2, 1, 3
-    };
+    std::mt19937 rng;
 
+    std::uniform_real_distribution<float> distribution(min, max);
 
-    sycl::queue queue;
+    
+    for (int triangle = 0; triangle < amount; triangle++) {
+        for (int vertex = 0; vertex < 3; vertex++) {
+            Vec3 position(distribution(rng), distribution(rng), distribution(rng));
+            Vec3 colour(distribution(rng), distribution(rng), distribution(rng));
+            verticies.push_back({ position, colour });
+            indicies.push_back(verticies.size() - 1);
+        }
+    }
+}
 
-    sycl::buffer<Vertex, 1> vertexInBuffer(vertices.data(), sycl::range<1>(vertices.size()));
-    sycl::buffer<std::uint16_t, 1> indexBuffer(indices.data(), sycl::range<1>(indices.size()));
+void runTest(sycl::queue& queue, sycl::buffer<Vertex, 1>& vertexInBuffer, sycl::buffer<std::uint16_t>& indexBuffer, sycl::buffer<Tri, 1>& vertexOutBuffer, sycl::buffer<Matrix, 1>& transformBuffer, sycl::buffer<Vec3, 2>& imageBuffer, const int& indexCount) {
 
-    //Put the matrix in a buffer
-    Matrix finalTransform = GetViewMatrix({1, 0, 0}, {0, 1, 0}, {0, 0, 1}, {-0.5f, -0.5f, -2.5f}) * GetPerspectiveMatrix(90.f, 0.1f, 1000.f);
-    sycl::buffer<Matrix, 1> transformBuffer(&finalTransform, sycl::range<1>(1));
-
-    // the buffer used after vertex shader
-    sycl::buffer<Tri, 1> vertexOutBuffer(sycl::range<1>(indices.size() / 3));
-
-
-    sycl::buffer<Vec3, 2> imageBuffer(sycl::range<2>(WIDTH, HEIGHT));
-
-    auto start = std::chrono::high_resolution_clock::now();
+    std::cout << "Now Testing: " << indexCount / 3 << " triangles" << std::endl;
+    auto vertexStart = std::chrono::high_resolution_clock::now();
 
     // This is the vertex shader, all it does is apply the transform to the vertex which convert into screen coordinates
     // This may feel like an over kill way of doing this but its the most convient way of doing it "Nicely" without loosing information
-    queue.submit([&](sycl::handler& handler) {
-        auto verticesAcc = vertexInBuffer.get_access<sycl::access::mode::read>(handler);
-        auto indexAcc = indexBuffer.get_access<sycl::access::mode::read>(handler);
+    try {
+        queue.submit([&](sycl::handler& handler) {
+            auto verticesAcc = vertexInBuffer.get_access<sycl::access::mode::read>(handler);
+            auto indexAcc = indexBuffer.get_access<sycl::access::mode::read>(handler);
 
-        auto transform = transformBuffer.get_access<sycl::access::mode::read>(handler);
-        auto vertexOutAcc = vertexOutBuffer.get_access<sycl::access::mode::write>(handler);
+            auto transform = transformBuffer.get_access<sycl::access::mode::read>(handler);
+            auto vertexOutAcc = vertexOutBuffer.get_access<sycl::access::mode::write>(handler);
 
-        // go triangle by triangle and perform the transform and move it into the triangle buffer
-        handler.parallel_for(sycl::nd_range<1>(indices.size(), 3), VertexShader{ verticesAcc , indexAcc, transform, vertexOutAcc});
-    });
+            // go triangle by triangle and perform the transform and move it into the triangle buffer
+            handler.parallel_for(sycl::nd_range<1>(indexCount, 3), VertexShader{ verticesAcc , indexAcc, transform, vertexOutAcc });
+            });
+    }
+    catch (sycl::exception e) {
+        std::cerr << "[SYCL ERROR] " << e.what() << std::endl;
+        __debugbreak();
+    }
+
+    queue.wait();
+    auto vertexEnd = std::chrono::high_resolution_clock::now();
+
+    std::cout << "The vertex shader ran in "<< std::chrono::duration_cast<std::chrono::milliseconds>(vertexEnd - vertexStart).count() << " milliseconds" << std::endl;
+
+    auto pixelStart = std::chrono::high_resolution_clock::now();
+    try {
+        //this is the pixel shader, it handles the colour of each triangle
+        queue.submit([&](sycl::handler& handler) {
+            auto vertexAcc = vertexOutBuffer.get_access<sycl::access::mode::read>(handler);
+
+            auto imageAcc = imageBuffer.get_access<sycl::access::mode::write>(handler);
+
+            size_t numberOfTriangles = indexCount / 3;
+            //A work group for each triangle
+            handler.parallel_for(sycl::range<1>(numberOfTriangles), PixelShader{ vertexAcc, imageAcc });
+            });
+    }
+    catch (sycl::exception e) {
+        std::cerr << "[SYCL ERROR] " << e.what() << std::endl;
+        __debugbreak();
+    }
 
     queue.wait();
 
-    //this is the pixel shader, it handles the colour of each triangle
-    queue.submit([&](sycl::handler& handler) {
-        auto vertexAcc = vertexOutBuffer.get_access<sycl::access::mode::read>(handler);
+    auto pixelEnd = std::chrono::high_resolution_clock::now();
+    std::cout << "The pixel shader ran in " << std::chrono::duration_cast<std::chrono::milliseconds>(pixelEnd - pixelStart).count() << " milliseconds" << std::endl;
+    std::cout << "Overall it ran in " << std::chrono::duration_cast<std::chrono::milliseconds>(pixelEnd - vertexStart).count() << " milliseconds" << std::endl;
+    std::cout << std::endl;
+}
 
-        auto imageAcc = imageBuffer.get_access<sycl::access::mode::write>(handler);
+void performTests(bool cpu=false){
+    sycl::queue queue;
+    if (cpu) {
+        std::cout << "Testing the CPU" << std::endl;
+        queue = sycl::queue(sycl::cpu_selector_v);
+    }
+    else {
+        queue = sycl::queue(sycl::gpu_selector_v);
+    }
 
-        size_t numberOfTriangles = indices.size() / 3;
-        //A work group for each triangle
-        handler.parallel_for(sycl::range<1>(numberOfTriangles), PixelShader{vertexAcc, imageAcc});
-    });
+    std::vector<Vertex> vertices;
+    std::vector<std::uint16_t> indices;
 
-    queue.wait();
+    //This buffer doesnt change between tests
+    Matrix finalTransform = GetViewMatrix({ 1, 0, 0 }, { 0, 1, 0 }, { 0, 0, 1 }, { 0.f, 0.f, -10.f }) * GetPerspectiveMatrix(90.f, 0.1f, 1000.f);
+    sycl::buffer<Matrix, 1> transformBuffer(&finalTransform, sycl::range<1>(1));
 
-    auto end = std::chrono::high_resolution_clock::now();
-    std::cout << std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count() << std::endl;
+    // 100 triangle test
+    {
+        vertices.clear();
+        indices.clear();
+        generateTriangles(100, vertices, indices);
 
-    sycl::host_accessor<Vec3, 2> imageAcc = imageBuffer.get_host_access();
-    WriteImageToFile("test", imageAcc);
+        sycl::buffer<Vertex, 1> vertexInBuffer(vertices.data(), sycl::range<1>(vertices.size()));
+        sycl::buffer<std::uint16_t, 1> indexBuffer(indices.data(), sycl::range<1>(indices.size()));
+        sycl::buffer<Tri, 1> vertexOutBuffer(sycl::range<1>(indices.size() / 3));
+        sycl::buffer<Vec3, 2> imageBuffer(sycl::range<2>(WIDTH, HEIGHT));
+
+        runTest(queue, vertexInBuffer, indexBuffer, vertexOutBuffer, transformBuffer, imageBuffer, indices.size());
+
+        sycl::host_accessor<Vec3, 2> imageAcc = imageBuffer.get_host_access();
+        std::string fileName = std::to_string(100) + "triangles";
+        if (cpu) {
+            fileName += "CPU";
+        }
+        else {
+            fileName += "GPU";
+        }
+        WriteImageToFile(fileName, imageAcc);
+
+    }
+    // 1000 triangle test
+    {
+        vertices.clear();
+        indices.clear();
+        generateTriangles(1000, vertices, indices);
+
+        sycl::buffer<Vertex, 1> vertexInBuffer(vertices.data(), sycl::range<1>(vertices.size()));
+        sycl::buffer<std::uint16_t, 1> indexBuffer(indices.data(), sycl::range<1>(indices.size()));
+        sycl::buffer<Tri, 1> vertexOutBuffer(sycl::range<1>(indices.size() / 3));
+        sycl::buffer<Vec3, 2> imageBuffer(sycl::range<2>(WIDTH, HEIGHT));
+
+        runTest(queue, vertexInBuffer, indexBuffer, vertexOutBuffer, transformBuffer, imageBuffer, indices.size());
+
+        sycl::host_accessor<Vec3, 2> imageAcc = imageBuffer.get_host_access();
+        std::string fileName = std::to_string(1000) + "triangles";
+        if (cpu) {
+            fileName += "CPU";
+        }
+        else {
+            fileName += "GPU";
+        }
+        WriteImageToFile(fileName, imageAcc);
+    }
+    // 10,0000 triangle test
+    {
+        vertices.clear();
+        indices.clear();
+        generateTriangles(10000, vertices, indices);
+
+        sycl::buffer<Vertex, 1> vertexInBuffer(vertices.data(), sycl::range<1>(vertices.size()));
+        sycl::buffer<std::uint16_t, 1> indexBuffer(indices.data(), sycl::range<1>(indices.size()));
+        sycl::buffer<Tri, 1> vertexOutBuffer(sycl::range<1>(indices.size() / 3));
+        sycl::buffer<Vec3, 2> imageBuffer(sycl::range<2>(WIDTH, HEIGHT));
+
+        runTest(queue, vertexInBuffer, indexBuffer, vertexOutBuffer, transformBuffer, imageBuffer, indices.size());
+
+        sycl::host_accessor<Vec3, 2> imageAcc = imageBuffer.get_host_access();
+        std::string fileName = std::to_string(10000) + "triangles";
+        if (cpu) {
+            fileName += "CPU";
+        }
+        else {
+            fileName += "GPU";
+        }
+        WriteImageToFile(fileName, imageAcc);
+    }
+}  
+
+int main() {
+    performTests();
+    performTests(true);
+
+    return 0;
 }
