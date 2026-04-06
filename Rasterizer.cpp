@@ -333,13 +333,14 @@ void generateTriangles(const int& amount, std::vector<Vertex>& verticies, std::v
 
     std::mt19937 rng;
 
-    std::uniform_real_distribution<float> distribution(min, max);
+    std::uniform_real_distribution<float> positionDistribution(min, max);
+    std::uniform_real_distribution<float> colourDistribution(0.f, 1.f);
 
     
     for (int triangle = 0; triangle < amount; triangle++) {
         for (int vertex = 0; vertex < 3; vertex++) {
-            Vec3 position(distribution(rng), distribution(rng), distribution(rng));
-            Vec3 colour(distribution(rng), distribution(rng), distribution(rng));
+            Vec3 position(positionDistribution(rng), positionDistribution(rng), positionDistribution(rng));
+            Vec3 colour(colourDistribution(rng), colourDistribution(rng), colourDistribution(rng));
             verticies.push_back({ position, colour });
             indicies.push_back(verticies.size() - 1);
         }
@@ -349,12 +350,13 @@ void generateTriangles(const int& amount, std::vector<Vertex>& verticies, std::v
 void runTest(sycl::queue& queue, sycl::buffer<Vertex, 1>& vertexInBuffer, sycl::buffer<std::uint16_t>& indexBuffer, sycl::buffer<Tri, 1>& vertexOutBuffer, sycl::buffer<Matrix, 1>& transformBuffer, sycl::buffer<Vec3, 2>& imageBuffer, const int& indexCount) {
 
     std::cout << "Now Testing: " << indexCount / 3 << " triangles" << std::endl;
-    auto vertexStart = std::chrono::high_resolution_clock::now();
+    std::uint64_t vertexDuration = 0;
+    std::uint64_t pixelDuration = 0;
 
     // This is the vertex shader, all it does is apply the transform to the vertex which convert into screen coordinates
     // This may feel like an over kill way of doing this but its the most convient way of doing it "Nicely" without loosing information
     try {
-        queue.submit([&](sycl::handler& handler) {
+        auto submitData = queue.submit([&](sycl::handler& handler) {
             auto verticesAcc = vertexInBuffer.get_access<sycl::access::mode::read>(handler);
             auto indexAcc = indexBuffer.get_access<sycl::access::mode::read>(handler);
 
@@ -363,22 +365,24 @@ void runTest(sycl::queue& queue, sycl::buffer<Vertex, 1>& vertexInBuffer, sycl::
 
             // go triangle by triangle and perform the transform and move it into the triangle buffer
             handler.parallel_for(sycl::nd_range<1>(indexCount, 3), VertexShader{ verticesAcc , indexAcc, transform, vertexOutAcc });
-            });
+        });
+        queue.wait();
+
+        auto vertexStart = submitData.get_profiling_info<sycl::info::event_profiling::command_start>();
+        auto vertexEnd = submitData.get_profiling_info<sycl::info::event_profiling::command_end>();
+        vertexDuration = (vertexEnd - vertexStart) / 1'000'000;
+
+        std::cout << "The vertex shader ran in " << vertexDuration << " milliseconds" << std::endl;
     }
     catch (sycl::exception e) {
         std::cerr << "[SYCL ERROR] " << e.what() << std::endl;
         __debugbreak();
     }
 
-    queue.wait();
-    auto vertexEnd = std::chrono::high_resolution_clock::now();
-
-    std::cout << "The vertex shader ran in "<< std::chrono::duration_cast<std::chrono::milliseconds>(vertexEnd - vertexStart).count() << " milliseconds" << std::endl;
-
     auto pixelStart = std::chrono::high_resolution_clock::now();
     try {
         //this is the pixel shader, it handles the colour of each triangle
-        queue.submit([&](sycl::handler& handler) {
+        auto submitData = queue.submit([&](sycl::handler& handler) {
             auto vertexAcc = vertexOutBuffer.get_access<sycl::access::mode::read>(handler);
 
             auto imageAcc = imageBuffer.get_access<sycl::access::mode::write>(handler);
@@ -386,18 +390,23 @@ void runTest(sycl::queue& queue, sycl::buffer<Vertex, 1>& vertexInBuffer, sycl::
             size_t numberOfTriangles = indexCount / 3;
             //A work group for each triangle
             handler.parallel_for(sycl::range<1>(numberOfTriangles), PixelShader{ vertexAcc, imageAcc });
-            });
+        });
+        queue.wait();
+
+        auto pixelStart = submitData.get_profiling_info<sycl::info::event_profiling::command_start>();
+        auto pixelEnd = submitData.get_profiling_info<sycl::info::event_profiling::command_end>();
+        pixelDuration = (pixelEnd - pixelStart) / 1'000'000;
+
+        std::cout << "The pixel shader ran in " << pixelDuration << " milliseconds" << std::endl;
+
     }
     catch (sycl::exception e) {
         std::cerr << "[SYCL ERROR] " << e.what() << std::endl;
         __debugbreak();
     }
 
-    queue.wait();
-
-    auto pixelEnd = std::chrono::high_resolution_clock::now();
-    std::cout << "The pixel shader ran in " << std::chrono::duration_cast<std::chrono::milliseconds>(pixelEnd - pixelStart).count() << " milliseconds" << std::endl;
-    std::cout << "Overall it ran in " << std::chrono::duration_cast<std::chrono::milliseconds>(pixelEnd - vertexStart).count() << " milliseconds" << std::endl;
+   
+    std::cout << "Overall it ran in " << vertexDuration + pixelDuration << " milliseconds" << std::endl;
     std::cout << std::endl;
 }
 
@@ -405,7 +414,7 @@ void performTests(bool cpu=false){
     sycl::queue queue;
     if (cpu) {
         std::cout << "Testing the CPU" << std::endl;
-        queue = sycl::queue(sycl::cpu_selector_v);
+        queue = sycl::queue(sycl::cpu_selector_v, sycl::property::queue::enable_profiling{});
     }
     else {
         queue = sycl::queue(sycl::gpu_selector_v);
@@ -491,7 +500,7 @@ void performTests(bool cpu=false){
 }  
 
 int main() {
-    performTests();
+    // performTests();
     performTests(true);
 
     return 0;
