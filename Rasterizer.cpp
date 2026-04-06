@@ -29,14 +29,6 @@ struct Vec2 {
     }
 };
 
-float dot(const Vec2& v1, const Vec2& v2) {
-    return v1.i * v2.i + v1.j * v2.j;
-}
-
-Vec2 perpendicular(const Vec2& vec) {
-    return { vec.j, -vec.i };
-}
-
 // The basic operators for 3D vector maths
 struct Vec3 {
     float i;
@@ -59,15 +51,6 @@ struct Vec3 {
         return { i * scalar, j * scalar, k * scalar };
     }
 };
-
-// the cross product of two 3D vectors
-Vec3 cross(const Vec3& v1, const Vec3& v2) {
-    return {
-        v1.j * v2.k - v1.k * v2.j,
-        v1.k * v2.i - v1.i * v2.k,
-        v1.i * v2.j - v1.j * v2.i
-    };
-}
 
 // the dot product of two 3D vectors
 float dot(const Vec3& v1, const Vec3& v2) {
@@ -276,7 +259,7 @@ struct VertexShader {
 };
 
 //The second kernal called
-struct PixelShader {
+struct BasicPixelShader {
     sycl::accessor<Tri, 1, sycl::access::mode::read> vertexAcc;
     sycl::accessor<Vec3, 2, sycl::access::mode::write> imageAcc;
 
@@ -328,22 +311,27 @@ struct PixelShader {
 };
 
 void generateTriangles(const int& amount, std::vector<Vertex>& verticies, std::vector<std::uint16_t>& indicies) {
-    int min = -10.f;
-    int max = 10.f;
+    int min = -30.0f;
+    int max = 30.0f;
 
     std::mt19937 rng;
 
     std::uniform_real_distribution<float> positionDistribution(min, max);
+    std::uniform_real_distribution<float> deltaInSize(-5.f, 5.f);
     std::uniform_real_distribution<float> colourDistribution(0.f, 1.f);
 
-    
     for (int triangle = 0; triangle < amount; triangle++) {
-        for (int vertex = 0; vertex < 3; vertex++) {
-            Vec3 position(positionDistribution(rng), positionDistribution(rng), positionDistribution(rng));
-            Vec3 colour(colourDistribution(rng), colourDistribution(rng), colourDistribution(rng));
-            verticies.push_back({ position, colour });
-            indicies.push_back(verticies.size() - 1);
-        }
+        Vec3 p0(positionDistribution(rng), positionDistribution(rng), positionDistribution(rng));
+        Vec3 p1(p0.i + deltaInSize(rng), p0.j + deltaInSize(rng), p0.k + deltaInSize(rng));
+        Vec3 p2(p0.i + deltaInSize(rng), p0.j + deltaInSize(rng), p0.k + deltaInSize(rng));
+
+        verticies.push_back({ p0, {colourDistribution(rng), colourDistribution(rng), colourDistribution(rng)} });
+        verticies.push_back({ p1, {colourDistribution(rng), colourDistribution(rng), colourDistribution(rng)} });
+        verticies.push_back({ p2, {colourDistribution(rng), colourDistribution(rng), colourDistribution(rng)} });
+
+        indicies.push_back(verticies.size() - 3);
+        indicies.push_back(verticies.size() - 2);
+        indicies.push_back(verticies.size() - 1);
     }
 }
 
@@ -379,7 +367,6 @@ void runTest(sycl::queue& queue, sycl::buffer<Vertex, 1>& vertexInBuffer, sycl::
         __debugbreak();
     }
 
-    auto pixelStart = std::chrono::high_resolution_clock::now();
     try {
         //this is the pixel shader, it handles the colour of each triangle
         auto submitData = queue.submit([&](sycl::handler& handler) {
@@ -389,7 +376,7 @@ void runTest(sycl::queue& queue, sycl::buffer<Vertex, 1>& vertexInBuffer, sycl::
 
             size_t numberOfTriangles = indexCount / 3;
             //A work group for each triangle
-            handler.parallel_for(sycl::range<1>(numberOfTriangles), PixelShader{ vertexAcc, imageAcc });
+            handler.parallel_for(sycl::range<1>(numberOfTriangles), BasicPixelShader{ vertexAcc, imageAcc });
         });
         queue.wait();
 
@@ -407,7 +394,6 @@ void runTest(sycl::queue& queue, sycl::buffer<Vertex, 1>& vertexInBuffer, sycl::
 
    
     std::cout << "Overall it ran in " << vertexDuration + pixelDuration << " milliseconds" << std::endl;
-    std::cout << std::endl;
 }
 
 void performTests(bool cpu=false){
@@ -417,14 +403,14 @@ void performTests(bool cpu=false){
         queue = sycl::queue(sycl::cpu_selector_v, sycl::property::queue::enable_profiling{});
     }
     else {
-        queue = sycl::queue(sycl::gpu_selector_v);
+        queue = sycl::queue(sycl::gpu_selector_v, sycl::property::queue::enable_profiling{});
     }
 
     std::vector<Vertex> vertices;
     std::vector<std::uint16_t> indices;
 
     //This buffer doesnt change between tests
-    Matrix finalTransform = GetViewMatrix({ 1, 0, 0 }, { 0, 1, 0 }, { 0, 0, 1 }, { 0.f, 0.f, -10.f }) * GetPerspectiveMatrix(90.f, 0.1f, 1000.f);
+    Matrix finalTransform = GetViewMatrix({ 1, 0, 0 }, { 0, 1, 0 }, { 0, 0, 1 }, { 0.f, 0.f, -20.f }) * GetPerspectiveMatrix(80.f, 0.1f, 1000.f);
     sycl::buffer<Matrix, 1> transformBuffer(&finalTransform, sycl::range<1>(1));
 
     // 100 triangle test
@@ -449,7 +435,8 @@ void performTests(bool cpu=false){
             fileName += "GPU";
         }
         WriteImageToFile(fileName, imageAcc);
-
+        std::cout << "Wrote the render to: " << fileName << ".bmp" << std::endl;
+        std::cout << std::endl;
     }
     // 1000 triangle test
     {
@@ -473,6 +460,8 @@ void performTests(bool cpu=false){
             fileName += "GPU";
         }
         WriteImageToFile(fileName, imageAcc);
+        std::cout << "Wrote the render to: " << fileName << ".bmp" << std::endl;
+        std::cout << std::endl;
     }
     // 10,0000 triangle test
     {
@@ -495,7 +484,9 @@ void performTests(bool cpu=false){
         else {
             fileName += "GPU";
         }
-        WriteImageToFile(fileName, imageAcc);
+        WriteImageToFile(fileName, imageAcc);       
+        std::cout << "Wrote the render to: " << fileName << ".bmp" << std::endl;
+        std::cout << std::endl;
     }
 }  
 
