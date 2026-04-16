@@ -135,12 +135,12 @@ struct Vertex {
 };
 
 struct Tri {
-    Vec2 positions[3];
+    Vec3 positions[3];
     Vec3 colours[3];
 };
 
 // This function is used to calculate the denominator of the edges weights used to simplify the maths when converting to barycentric coordinates
-float edge(Vec2 a, Vec2 b, Vec2 c) {
+float edge(const Vec3& a, const Vec3& b, const Vec3& c) {
     return (b.i - a.i) * (c.j - a.j) - (b.j - a.j) * (c.i - a.i);
 }
 
@@ -253,7 +253,7 @@ struct VertexShader {
         position.j = (position.j + 1) * (HEIGHT / 2.f);
 
         // put the data in out buffer
-        vertexOutAcc[triangle.get_group(0)].positions[triangle.get_local_id(0)] = { position.i, position.j };
+        vertexOutAcc[triangle.get_group(0)].positions[triangle.get_local_id(0)] = { position.i, position.j, position.k };
         vertexOutAcc[triangle.get_group(0)].colours[triangle.get_local_id(0)] = verticesAcc[vertexIndex].colour;
     }
 };
@@ -264,9 +264,9 @@ struct BasicPixelShader {
     sycl::accessor<Vec3, 2, sycl::access::mode::write> imageAcc;
 
     void operator()(sycl::id<1> triangle) const {
-        Vec2 p0 = vertexAcc[triangle.get(0)].positions[0];
-        Vec2 p1 = vertexAcc[triangle.get(0)].positions[1];
-        Vec2 p2 = vertexAcc[triangle.get(0)].positions[2];
+        Vec3 p0 = vertexAcc[triangle.get(0)].positions[0];
+        Vec3 p1 = vertexAcc[triangle.get(0)].positions[1];
+        Vec3 p2 = vertexAcc[triangle.get(0)].positions[2];
 
         //Compute the bounding box of a triangle
         float minX = sycl::min(p0.i, sycl::min(p1.i, p2.i));
@@ -284,7 +284,8 @@ struct BasicPixelShader {
             if (y < 0 || y >= HEIGHT) continue;
             for (int x = static_cast<int>(sycl::floor(minX)); x < static_cast<int>(sycl::ceil(maxX)); x++) {
                 if (x < 0 || x >= WIDTH) continue;
-                Vec2 pixel = { x + 0.5f , y + 0.5f }; // sample the centre of the pixel
+                // the last component is actually used but is need to make the function work.
+                Vec3 pixel = { x + 0.5f , y + 0.5f, 0.f}; // sample the centre of the pixel
 
                 float weight0 = edge(p1, p2, pixel) / denom;
                 float weight1 = edge(p2, p0, pixel) / denom;
@@ -297,14 +298,67 @@ struct BasicPixelShader {
                 // blends between the triangles
                 Vec3 colour = vertexAcc[triangle.get(0)].colours[0] * weight0 + vertexAcc[triangle.get(0)].colours[1] * weight1 + vertexAcc[triangle.get(0)].colours[2] * weight2;
 
-                // Triangles can over lap so uhh race condition, not the best solution but the proper way of doing feels out of scope
-                auto pixelI = sycl::atomic_ref<float, sycl::memory_order::relaxed, sycl::memory_scope::device>(imageAcc[sycl::id<2>(static_cast<size_t>(x), static_cast<size_t>(y))].i);
-                auto pixelJ = sycl::atomic_ref<float, sycl::memory_order::relaxed, sycl::memory_scope::device>(imageAcc[sycl::id<2>(static_cast<size_t>(x), static_cast<size_t>(y))].j);
-                auto pixelK = sycl::atomic_ref<float, sycl::memory_order::relaxed, sycl::memory_scope::device>(imageAcc[sycl::id<2>(static_cast<size_t>(x), static_cast<size_t>(y))].k);
+                imageAcc[sycl::id<2>(static_cast<size_t>(x), static_cast<size_t>(y))] = colour;
+            }
+        }
+    }
+};
 
-                pixelI.store(colour.i);
-                pixelJ.store(colour.j);
-                pixelK.store(colour.k);
+// The improvement here is using an atmoic depth buffer for each pixel to mostly elementate a race condition 
+// and ensure the nearest triangle is renderered
+struct DepthBufferedPixelShader {
+    sycl::accessor<Tri, 1, sycl::access::mode::read> vertexAcc;
+    sycl::accessor<Vec3, 2, sycl::access::mode::write> imageAcc;
+    sycl::accessor<float, 2, sycl::access::mode::read_write> depthAcc;
+
+
+    void operator()(sycl::id<1> triangle) const {
+        Vec3 p0 = vertexAcc[triangle.get(0)].positions[0];
+        Vec3 p1 = vertexAcc[triangle.get(0)].positions[1];
+        Vec3 p2 = vertexAcc[triangle.get(0)].positions[2];
+
+        //Compute the bounding box of a triangle
+        float minX = sycl::min(p0.i, sycl::min(p1.i, p2.i));
+        float minY = sycl::min(p0.j, sycl::min(p1.j, p2.j));
+
+        float maxX = sycl::max(p0.i, sycl::max(p1.i, p2.i));
+        float maxY = sycl::max(p0.j, sycl::max(p1.j, p2.j));
+
+        float denom = edge(p0, p1, p2);
+        // makes sure the triangle is actually possible to render
+        if (denom == 0)
+            return;
+
+        for (int y = static_cast<int>(sycl::floor(minY)); y < static_cast<int>(sycl::ceil(maxY)); y++) {
+            if (y < 0 || y >= HEIGHT) continue;
+            for (int x = static_cast<int>(sycl::floor(minX)); x < static_cast<int>(sycl::ceil(maxX)); x++) {
+                if (x < 0 || x >= WIDTH) continue;
+                // the last component is actually used but is need to make the function work.
+                Vec3 pixel = { x + 0.5f , y + 0.5f, 0.f }; // sample the centre of the pixel
+
+                float weight0 = edge(p1, p2, pixel) / denom;
+                float weight1 = edge(p2, p0, pixel) / denom;
+                float weight2 = edge(p0, p1, pixel) / denom;
+
+                // checks if the point is in the triangle
+                if (weight0 < 0.f || weight1 < 0 || weight2 < 0)
+                    continue;
+
+                // interpolate between the pixels to find the depth of the triangle at the given triangle
+                float depth = p0.k * weight0 + p1.k * weight1 + p2.k * weight2;
+                sycl::atomic_ref<float, sycl::memory_order::relaxed, sycl::memory_scope::device> depthAtomic(depthAcc[sycl::id<2>(static_cast<size_t>(x), static_cast<size_t>(y))]);
+
+                float expected = depthAtomic.load();
+                bool won = false;
+                do {
+                    if (depth >= expected) break;
+                } while (!(won = depthAtomic.compare_exchange_weak(expected, depth)));
+
+                if (won) {
+                    // blends between the triangles
+                    Vec3 colour = vertexAcc[triangle.get(0)].colours[0] * weight0 + vertexAcc[triangle.get(0)].colours[1] * weight1 + vertexAcc[triangle.get(0)].colours[2] * weight2;
+                    imageAcc[sycl::id<2>(static_cast<size_t>(x), static_cast<size_t>(y))] = colour;
+                }
             }
         }
     }
@@ -396,7 +450,67 @@ void runTest(sycl::queue& queue, sycl::buffer<Vertex, 1>& vertexInBuffer, sycl::
     std::cout << "Overall it ran in " << vertexDuration + pixelDuration << " milliseconds" << std::endl;
 }
 
-void performTests(bool cpu=false){
+void runImprovedTest(sycl::queue& queue, sycl::buffer<Vertex, 1>& vertexInBuffer, sycl::buffer<std::uint16_t>& indexBuffer, sycl::buffer<Tri, 1>& vertexOutBuffer, sycl::buffer<Matrix, 1>& transformBuffer, sycl::buffer<Vec3, 2>& imageBuffer, sycl::buffer<float, 2>& depthBuffer, const int& indexCount) {
+    std::cout << "Now Testing: " << indexCount / 3 << " triangles" << std::endl;
+    std::uint64_t vertexDuration = 0;
+    std::uint64_t pixelDuration = 0;
+
+    // This is the vertex shader, all it does is apply the transform to the vertex which convert into screen coordinates
+    // This may feel like an over kill way of doing this but its the most convient way of doing it "Nicely" without loosing information
+    try {
+        auto submitData = queue.submit([&](sycl::handler& handler) {
+            auto verticesAcc = vertexInBuffer.get_access<sycl::access::mode::read>(handler);
+            auto indexAcc = indexBuffer.get_access<sycl::access::mode::read>(handler);
+
+            auto transform = transformBuffer.get_access<sycl::access::mode::read>(handler);
+            auto vertexOutAcc = vertexOutBuffer.get_access<sycl::access::mode::write>(handler);
+
+            // go triangle by triangle and perform the transform and move it into the triangle buffer
+            handler.parallel_for(sycl::nd_range<1>(indexCount, 3), VertexShader{ verticesAcc , indexAcc, transform, vertexOutAcc });
+            });
+        queue.wait();
+
+        auto vertexStart = submitData.get_profiling_info<sycl::info::event_profiling::command_start>();
+        auto vertexEnd = submitData.get_profiling_info<sycl::info::event_profiling::command_end>();
+        vertexDuration = (vertexEnd - vertexStart) / 1'000'000;
+
+        std::cout << "The vertex shader ran in " << vertexDuration << " milliseconds" << std::endl;
+    }
+    catch (sycl::exception e) {
+        std::cerr << "[SYCL ERROR] " << e.what() << std::endl;
+        __debugbreak();
+    }
+
+    try {
+        //this is the pixel shader, it handles the colour of each triangle
+        auto submitData = queue.submit([&](sycl::handler& handler) {
+            auto vertexAcc = vertexOutBuffer.get_access<sycl::access::mode::read>(handler);
+            auto imageAcc = imageBuffer.get_access<sycl::access::mode::write>(handler);
+            auto depthAcc = depthBuffer.get_access<sycl::access::mode::read_write>(handler);
+
+            size_t numberOfTriangles = indexCount / 3;
+            //A work group for each triangle
+            handler.parallel_for(sycl::range<1>(numberOfTriangles), DepthBufferedPixelShader{ vertexAcc, imageAcc, depthAcc });
+            });
+        queue.wait();
+
+        auto pixelStart = submitData.get_profiling_info<sycl::info::event_profiling::command_start>();
+        auto pixelEnd = submitData.get_profiling_info<sycl::info::event_profiling::command_end>();
+        pixelDuration = (pixelEnd - pixelStart) / 1'000'000;
+
+        std::cout << "The improved pixel shader ran in " << pixelDuration << " milliseconds" << std::endl;
+
+    }
+    catch (sycl::exception e) {
+        std::cerr << "[SYCL ERROR] " << e.what() << std::endl;
+        __debugbreak();
+    }
+
+
+    std::cout << "Overall it ran in " << vertexDuration + pixelDuration << " milliseconds" << std::endl;
+}
+
+void performTests(bool improved, bool cpu=false){
     sycl::queue queue;
     if (cpu) {
         std::cout << "Testing the CPU" << std::endl;
@@ -424,7 +538,15 @@ void performTests(bool cpu=false){
         sycl::buffer<Tri, 1> vertexOutBuffer(sycl::range<1>(indices.size() / 3));
         sycl::buffer<Vec3, 2> imageBuffer(sycl::range<2>(WIDTH, HEIGHT));
 
-        runTest(queue, vertexInBuffer, indexBuffer, vertexOutBuffer, transformBuffer, imageBuffer, indices.size());
+        if (improved) {
+            std::vector<float> depthData(WIDTH * HEIGHT, 1.f);
+            sycl::buffer<float, 2> depthBuffer(depthData.data(), sycl::range<2>(WIDTH, HEIGHT));
+            runImprovedTest(queue, vertexInBuffer, indexBuffer, vertexOutBuffer, transformBuffer, imageBuffer, depthBuffer, indices.size());
+        }
+        else {
+            runTest(queue, vertexInBuffer, indexBuffer, vertexOutBuffer, transformBuffer, imageBuffer, indices.size());
+        }
+
 
         sycl::host_accessor<Vec3, 2> imageAcc = imageBuffer.get_host_access();
         std::string fileName = std::to_string(100) + "triangles";
@@ -434,6 +556,12 @@ void performTests(bool cpu=false){
         else {
             fileName += "GPU";
         }
+
+        if (improved) {
+            fileName += "Improved";
+        }
+
+
         WriteImageToFile(fileName, imageAcc);
         std::cout << "Wrote the render to: " << fileName << ".bmp" << std::endl;
         std::cout << std::endl;
@@ -449,16 +577,30 @@ void performTests(bool cpu=false){
         sycl::buffer<Tri, 1> vertexOutBuffer(sycl::range<1>(indices.size() / 3));
         sycl::buffer<Vec3, 2> imageBuffer(sycl::range<2>(WIDTH, HEIGHT));
 
-        runTest(queue, vertexInBuffer, indexBuffer, vertexOutBuffer, transformBuffer, imageBuffer, indices.size());
+        if (improved) {
+            std::vector<float> depthData(WIDTH * HEIGHT, 1.f);
+            sycl::buffer<float, 2> depthBuffer(depthData.data(), sycl::range<2>(WIDTH, HEIGHT));
+            runImprovedTest(queue, vertexInBuffer, indexBuffer, vertexOutBuffer, transformBuffer, imageBuffer, depthBuffer, indices.size());
+        }
+        else {
+            runTest(queue, vertexInBuffer, indexBuffer, vertexOutBuffer, transformBuffer, imageBuffer, indices.size());
+        }
+
 
         sycl::host_accessor<Vec3, 2> imageAcc = imageBuffer.get_host_access();
         std::string fileName = std::to_string(1000) + "triangles";
+        
         if (cpu) {
             fileName += "CPU";
         }
         else {
             fileName += "GPU";
         }
+
+        if (improved) {
+            fileName += "Improved";
+        }
+
         WriteImageToFile(fileName, imageAcc);
         std::cout << "Wrote the render to: " << fileName << ".bmp" << std::endl;
         std::cout << std::endl;
@@ -474,16 +616,30 @@ void performTests(bool cpu=false){
         sycl::buffer<Tri, 1> vertexOutBuffer(sycl::range<1>(indices.size() / 3));
         sycl::buffer<Vec3, 2> imageBuffer(sycl::range<2>(WIDTH, HEIGHT));
 
-        runTest(queue, vertexInBuffer, indexBuffer, vertexOutBuffer, transformBuffer, imageBuffer, indices.size());
+        if (improved) {
+            std::vector<float> depthData(WIDTH * HEIGHT, 1.f);
+            sycl::buffer<float, 2> depthBuffer(depthData.data(), sycl::range<2>(WIDTH, HEIGHT));
+            runImprovedTest(queue, vertexInBuffer, indexBuffer, vertexOutBuffer, transformBuffer, imageBuffer, depthBuffer, indices.size());
+        }
+        else {
+            runTest(queue, vertexInBuffer, indexBuffer, vertexOutBuffer, transformBuffer, imageBuffer, indices.size());
+        }
+
 
         sycl::host_accessor<Vec3, 2> imageAcc = imageBuffer.get_host_access();
         std::string fileName = std::to_string(10000) + "triangles";
+        
         if (cpu) {
             fileName += "CPU";
         }
         else {
             fileName += "GPU";
         }
+
+        if (improved) {
+            fileName += "Improved";
+        }
+
         WriteImageToFile(fileName, imageAcc);       
         std::cout << "Wrote the render to: " << fileName << ".bmp" << std::endl;
         std::cout << std::endl;
@@ -491,8 +647,10 @@ void performTests(bool cpu=false){
 }  
 
 int main() {
-    // performTests();
-    performTests(true);
+    performTests(false, true);
+    
+    std::cout << std::endl << "Now conduction the improved tests" << std::endl;
+    performTests(true, true);
 
     return 0;
 }
